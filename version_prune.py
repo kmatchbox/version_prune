@@ -8,39 +8,69 @@ import threading
 import shutil
 from pathlib import Path
 
-def scrape_folder(path, target_folders):
+def find_target_folders_with_versions(path, target_folders):
     """
-    Scan for version folders within specified target folder types.
+    Scan for target folders and recursively find version directories within them.
     
     Args:
         path (str): Root path to scan
         target_folders (set): Set of folder names to look for version folders in
     
     Returns:
-        set: Set of unique paths containing version folders
+        dict: Dictionary mapping folder paths to their version directories
     """
-    version_folders = set()
+    folders_with_versions = {}
     
-    for root, dirs, files in os.walk(path):
-        root_name = os.path.basename(root)
+    def scan_for_versions(folder_path, depth=0, max_depth=10):
+        """
+        Recursively scan within a target folder for all paths containing version directories.
+        Returns a list of tuples: [(path, [version_folders]), ...]
+        """
+        if depth > max_depth:
+            return []
         
-        # Check if current folder is one of our target folders
-        if root_name in target_folders:
-            # Look for version folders starting with 'v0'
-            for dir_name in dirs:
-                if dir_name.startswith("v0"):
-                    version_folders.add(root)
-                    break  # Found at least one version folder, no need to check others
+        version_dirs = []
+        results = []
+        
+        try:
+            for item in os.listdir(folder_path):
+                item_path = os.path.join(folder_path, item)
+                if os.path.isdir(item_path):
+                    # If it's a version folder, add it to current level
+                    if item.startswith("v0"):
+                        version_dirs.append(item)
+                    else:
+                        # Also recurse into non-version subdirectories to find more version folders
+                        sub_results = scan_for_versions(item_path, depth + 1, max_depth)
+                        results.extend(sub_results)
+        except (OSError, PermissionError) as e:
+            print(f"Warning: Could not access {folder_path}: {e}")
+        
+        # If we found version folders at this level, add to results
+        # This happens regardless of whether we found subdirectories with versions
+        if version_dirs:
+            results.append((folder_path, version_dirs))
+        
+        return results
     
-    return version_folders
-
-def animated_loading():
-    """Display animated loading indicator."""
-    chars = "/—\\|"
-    for char in chars:
-        sys.stdout.write('\r' + 'Scanning... ' + char)
-        time.sleep(.1)
-        sys.stdout.flush()
+    try:
+        for root, dirs, files in os.walk(path):
+            root_name = os.path.basename(root)
+            
+            # Check if current folder is one of our target folders
+            if root_name in target_folders:
+                # Recursively scan within this target folder for all version directories
+                results = scan_for_versions(root)
+                for version_path, version_dirs in results:
+                    folders_with_versions[version_path] = sorted(version_dirs)
+                
+                # Don't walk into subdirectories of target folders
+                # since we're handling them separately
+                dirs.clear()
+    except (OSError, PermissionError) as e:
+        print(f"Warning: Error scanning directory {path}: {e}")
+    
+    return folders_with_versions
 
 def human_size(fsize, units=[' bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB']):
     """Convert bytes to human readable format."""
@@ -60,30 +90,7 @@ def folder_size(folder_path):
     
     return total_size
 
-def get_version_folders(folder_path):
-    """
-    Get list of version folders, filtering out files and system folders.
-    
-    Args:
-        folder_path (str): Path to check for version folders
-    
-    Returns:
-        list: Sorted list of version folder names
-    """
-    try:
-        items = os.listdir(folder_path)
-    except OSError as e:
-        print(f"Warning: Could not access {folder_path}: {e}")
-        return []
-    
-    # Filter to only include directories that start with 'v0'
-    version_dirs = []
-    for item in items:
-        item_path = os.path.join(folder_path, item)
-        if os.path.isdir(item_path) and item.startswith('v0'):
-            version_dirs.append(item)
-    
-    return sorted(version_dirs)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -91,13 +98,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python version_prune.py /path/to/project --threshold 5
-  python version_prune.py /path/to/project -t 3 --folders renders comps test
-  python version_prune.py /path/to/project -t 2 --dry --folders renders
+  python version_prune.py --path /path/to/project --threshold 5
+  python version_prune.py -p /path/to/project -t 3 --folders renders comps test
+  python version_prune.py -p /path/to/project -t 2 --dry --folders renders
         """
     )
     
-    parser.add_argument("path", help="The path to start crawling from.", type=str)
+    parser.add_argument("--path", "-p", help="The path to start crawling from.", type=str, required=True)
     parser.add_argument("--threshold", "-t", metavar='N', 
                        help="The number of versions to keep.", type=int, required=True)
     parser.add_argument("--dry", "-d", help="Dry-run to see what would be removed.", 
@@ -128,37 +135,55 @@ Examples:
     print(f"Searching for version folders in: {', '.join(sorted(target_folders))}")
     print("This may take a while.\n")
     
-    # Global variable to store results from thread
-    version_folders = set()
+    # Use a simple approach - store result in a list that can be modified by thread
+    result = [None]
+    animation_stop = threading.Event()
     
-    def scrape_wrapper():
-        nonlocal version_folders
-        version_folders = scrape_folder(args.path, target_folders)
+    def scrape_target():
+        result[0] = find_target_folders_with_versions(args.path, target_folders)
+        animation_stop.set()
     
-    # Start scraping in another thread with loading animation
-    scrape_process = threading.Thread(target=scrape_wrapper)
+    def animate_loading():
+        chars = "/—\\|"
+        i = 0
+        while not animation_stop.is_set():
+            sys.stdout.write('\r' + 'Scanning... ' + chars[i % len(chars)])
+            sys.stdout.flush()
+            time.sleep(0.1)
+            i += 1
+    
+    # Start both threads
+    scrape_process = threading.Thread(target=scrape_target)
+    animation_thread = threading.Thread(target=animate_loading)
+    
     scrape_process.daemon = True
-    scrape_process.start()
+    animation_thread.daemon = True
     
-    while scrape_process.is_alive():
-        animated_loading()
+    scrape_process.start()
+    animation_thread.start()
+    
+    # Wait for scraping to complete
+    scrape_process.join()
+    animation_stop.set()
+    animation_thread.join(timeout=0.5)  # Give animation thread time to stop
     
     # Clear the loading animation
-    sys.stdout.write('\r' + ' ' * 20 + '\r')
+    sys.stdout.write('\r' + 'Scanning complete!' + ' ' * 10 + '\n')
     sys.stdout.flush()
     
-    if not version_folders:
+    folders_with_versions = result[0]
+    
+    if not folders_with_versions:
         print("No version folders found matching the criteria.")
         return
     
-    print(f"Found {len(version_folders)} folders containing version directories.\n")
+    print(f"Found {len(folders_with_versions)} folders containing version directories.\n")
     
     # Process each folder containing version directories
     total_remove = 0
     remove_list = []
     
-    for folder in sorted(version_folders):
-        versions = get_version_folders(folder)
+    for folder, versions in sorted(folders_with_versions.items()):
         
         if not versions:
             continue
